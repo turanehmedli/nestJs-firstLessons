@@ -10,7 +10,7 @@ import { Role } from "src/common/enums/role.enum";
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Controller("users")
-export class UsersController{
+export class UserController{
     constructor(private service:UserService ){}
 
     @Roles(Role.ADMIN)

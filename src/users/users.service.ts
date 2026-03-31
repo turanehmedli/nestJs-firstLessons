@@ -9,7 +9,7 @@ export class UserService {
     constructor(@InjectModel(User.name) private model:Model<User>){}
 
     create(dto){
-        return this.model.create(dto)
+        return this.model.create(dto) 
     }
 
     findByEmail(email:string){
