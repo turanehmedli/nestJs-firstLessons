@@ -1,23 +1,30 @@
-import {Prop, Schema, SchemaFactory} from '@nestjs/mongoose'
-import { Document } from 'mongoose'
-import {Role} from '../common/enums/role.enum'
+import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
+import { HydratedDocument } from 'mongoose';
+import { Role } from '../common/enums/role.enum';
 
-@Schema() //@ bu isarenin adi decoreti
-export class User extends Document {
-    @Prop({
-        unique:true
-    })
-    email:string;
+export type UserDocument = HydratedDocument<User>;
 
-    @Prop({
-        minLength:[6, "password must be at least 6 characters long"]
-    })
-    password:string;
+@Schema({ timestamps: true })
+export class User {
+  @Prop({
+    unique: true,
+    required: true
+  })
+  email!: string;
 
-    @Prop({
-        default:Role.USER
-    })
-    role:Role
+  @Prop({
+    required: true,
+    minlength: 6
+  })
+  password!: string;
+
+  @Prop({
+    default: Role.USER
+  })
+  role!: Role;
+
+  @Prop()
+  refreshToken!:string;
 }
 
-export const UserSchema = SchemaFactory.createForClass(User)
+export const UserSchema = SchemaFactory.createForClass(User);

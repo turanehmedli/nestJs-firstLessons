@@ -7,17 +7,16 @@ import { Model } from "mongoose";
 export class TodoService{
     constructor(@InjectModel(Todo.name) private model:Model<Todo>){}
 
-    getAllTodo(){
+    async getAllTodo(){
         return this.model.find()
     }
 
-    getTodoById(id:string){
+    async getTodoById(id:string){
         return this.model.findOne({id})
     }
 
-    create(dto){
+    async create(dto){
         return this.model.create(dto)
     }
-
-    
+   
 }
