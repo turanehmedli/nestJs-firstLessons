@@ -1,16 +1,28 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
-import {AuthModule} from './auth/auth.module'
-import {UsersModule} from './users/users.module'
-import {TodosModule} from './todos/todos.module'
+import { MongoModule } from './module/mongo/mongo.module';
+import { AuthModule } from './module/auth/auth.module';
+import { UserModule } from 'src/module/user/user.module';
+import { ConfigModule } from '@nestjs/config';
+import { MailModule } from './module/mail/mail.module';
+import { RedisModule } from './module/redis/redis.module';
+import { KafkaModule } from './module/kafka/kafka.module';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { typeOrmConfig } from './ormconfig';
 
 @Module({
   imports: [
-    MongooseModule.forRoot(process.env.MONGO_URL!),
+    ConfigModule.forRoot({
+      isGlobal: true,
+    }),
+    MongooseModule.forRoot(process.env.MONGO_URL!), //! !bu type errorunu onune kecir
     AuthModule,
-    UsersModule,
-    TodosModule
+    UserModule,
+    MongoModule,
+    MailModule,
+    RedisModule,
+    KafkaModule,
+    TypeOrmModule.forRoot(typeOrmConfig),
   ],
-
 })
 export class AppModule {}
