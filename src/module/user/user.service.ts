@@ -13,9 +13,8 @@ import * as bcrypt from 'bcrypt';
 import { MailService } from '../mail/mail.service';
 import { KafkaService } from '../kafka/kafka.service';
 import { MongoService } from '../mongo/mongo.service';
-import { randomBytes, verify } from 'crypto';
+import { randomBytes } from 'crypto';
 import { addSeconds } from 'date-fns';
-import { relative } from 'path';
 
 @Injectable()
 export class UserService {
@@ -26,7 +25,7 @@ export class UserService {
     private evRepo: Repository<EmailVerification>,
     @InjectRepository(PasswordReset) private prRepo: Repository<PasswordReset>,
     @InjectRepository(UserSession) private sessionRepo: Repository<UserSession>,
-    private mailService: MailService.service,
+    private mailService: MailService,
     private kafkaService: KafkaService,
     private mongoService: MongoService,
   ) {}
@@ -59,7 +58,7 @@ export class UserService {
   }
 
   async verifyPassword(user: User, pass: string) {
-    return bcrypt.compare(pass, user.passwordHash);
+    return bcrypt.compare(pass, user.passwordHash!);
   }
 
   private async hashToken(token: string) {
@@ -69,13 +68,13 @@ export class UserService {
   async createEmailVerification(user: User) {
     const token = randomBytes(32).toString('hex');
     const tokenHash = await this.hashToken(token);
-    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24);
-    const ev = this.evRepo.create({ tokenHash, user, expiresAt });
+    const expireAt = new Date(Date.now() + 1000 * 60 * 60 * 24);
+    const ev = this.evRepo.create({ tokenHash, user, expireAt });
     await this.evRepo.save(ev);
 
     const verifyUrl = `${process.env.APP_URL}/api/auth/verify-email?token=${token}`;
     const html = `<p>Verify your email by clicking <a href="${verifyUrl}">here</a>. Link expires in 24 hours. </p>`;
-    await this.mailService.sendEmail(user.email, 'Verify your email', html);
+    await this.mailService.sendMail(user.email!, 'Verify your email', html);
     await this.mongoService.log('info', 'Verification created', {
       userId: user.id,
     });
@@ -87,7 +86,7 @@ export class UserService {
     for(const candidate of all){
       const ok = await bcrypt.compare(token, candidate.tokenHash)
       if(ok){
-        if(candidate.expiresAt < new Date()){
+        if(candidate.expireAt! < new Date()){
           await this.evRepo.remove(candidate)
           throw new BadRequestException('Token expired')
         }
@@ -114,7 +113,7 @@ export class UserService {
 
     const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${token}`
     const html = `<p>Reset your password by clicking <a href="${resetUrl}">here</a>. Link expires in 24 hours. </p>`;
-    await this.mailService.sendEmail(user.email, "Reset your password",html)
+    await this.mailService.sendMail(user.email!, "Reset your password",html)
     await this.mongoService.log('info','Password reset required',{userId:user.id})
     return {pr, token}
   }
@@ -136,10 +135,70 @@ export class UserService {
 
         //revoke all session
         await this.sessionRepo.update({userId:candidate.user.id, revoked:false},{revoked:true, revokedAt:new Date()})
-
+        await this.kafkaService.produce("auth.user.password.change",{userId:candidate.user.id, changedAt:new Date()})
+        await this.mongoService.log('info','Password change via reset',{userId:candidate.user.id})
+        return candidate.user
       }
     }
+
+    throw new BadRequestException('Invalid Token')
   }
 
+  async createSession(user: User, refreshToken:string, ip?:string, device?:string){
+     const refreshTokenHash = await bcrypt.hash(refreshToken, this.saltRounds)
+     const ttlStr = process.env.JWT_REFRESH_TOKEN_EXPIRATION || '7d'
+     const ttlSeconds = this.parseExpiration(ttlStr)
+     const expiresAt = new Date(Date.now()+ttlSeconds * 1000)
 
+     const session = this.sessionRepo.create({
+      user,
+      userId:user.id,
+      refreshTokenHash,
+      ip,
+      device,
+      createdAt:new Date(), 
+      expiresAt,
+      revoked:false
+     })
+
+     const saved = await this.sessionRepo.save(session)
+     await this.kafkaService.produce('auth.session.created', {sessionId:saved.id, userId:user.id, createdAt: saved.createdAt})
+     await this.mongoService.log('info',"Session created",{sessionId:saved.id, userId:user.id, ip, device})
+     return saved
+  }
+
+  async revokeSession(sessionId:string){
+    const session = await this.sessionRepo.findOne({where:{id: sessionId}})
+    if(!session) throw new NotFoundException('Session not found')
+    session.revoked = true
+    session.revokedAt = new Date()
+    await this.sessionRepo.save(session)
+    await this.kafkaService.produce('auth.session.revoked', {sessionId, revokeAt:session.revokedAt})
+    await this.mongoService.log('info','Session revoked',{sessionId})
+  }
+
+  async findSessionByRefreshToken(refreshToken:string){
+    const sessions = await this.sessionRepo.find({where:{revoked: false}})
+    for(const s of sessions){
+      const ok = await bcrypt.compare(refreshToken, s.refreshTokenHash)
+      if(ok) return s
+    }
+
+    return null
+  }
+
+  private parseExpiration(exp:string){
+    if(exp.endsWith('d')) return Number(exp.slice(0, -1)) * 86400
+    if(exp.endsWith('h')) return Number(exp.slice(0, -1)) * 3600
+    if(exp.endsWith('m')) return Number(exp.slice(0, -1)) * 60
+    if(exp.endsWith('s')) return Number(exp.slice(0, -1))
+
+    const n = Number(exp)
+
+    return isNaN(n) ? 7 * 86400 : n
+  }
+
+  async listAll(){
+    return this.userRepo.find({select:['id','email','name','isVerified','createdAt']})
+  }
 }

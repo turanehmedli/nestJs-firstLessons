@@ -11,18 +11,18 @@ import { User } from './user.entity';
 
 @Entity({ name: 'password_resets' })
 export class PasswordReset {
-  @PrimaryGeneratedColumn('uuid') id: string;
+  @PrimaryGeneratedColumn('uuid') id!: string;
 
   @Index()
-  @Column() tokenHash: string;
+  @Column() tokenHash!: string;
 
   @ManyToOne(() => User, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'user_id' })
-  user: User;
+  user!: User;
 
-  @Column({ type: 'timestamptz' }) expiresAt: Date;
+  @Column({ type: 'timestamptz' }) expiresAt!: Date;
 
-  @CreateDateColumn() createdAt: Date;
+  @CreateDateColumn() createdAt!: Date;
 
   @Column({ nullable: true }) usedAt?: Date;
 }

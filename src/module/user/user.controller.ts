@@ -19,7 +19,7 @@ export class UserController {
   @Roles(Role.ADMIN)
   @Get()
   getAllUsers(): Promise<UserResponseDto[]> {
-    return this.service.getAllUsers();
+    return this.service.getAllUser();
   }
 
   @Roles(Role.ADMIN)

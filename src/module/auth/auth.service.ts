@@ -1,94 +1,104 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, Inject, BadRequestException } from '@nestjs/common';
 import { UserService } from '../user/user.service';
-import { RegisterDto } from './dto/register.dto';
-import { LoginDto } from './dto/login.dto';
-import * as bcrypt from 'bcrypt';
 import { JwtService } from '@nestjs/jwt';
-import { Role } from '../../common/enums/role.enum';
+import { randomBytes } from 'crypto';
+import { Redis } from 'ioredis';
+import { KafkaService } from '../kafka/kafka.service';
 
 @Injectable()
 export class AuthService {
   constructor(
-    private UserService: UserService,
-    private jwt: JwtService,
+    private usersService: UserService,
+    private jwtService: JwtService,
+    @Inject('REDIS') private readonly redisClient: Redis,
+    private kafkaService: KafkaService,
   ) {}
 
-  //*token generate access and refresh
-  async generateToken(user: any) {
-    const payload: any = { id: String(user._id), role: user.role };
-
-    const accessToken = await this.jwt.signAsync(payload, {
-      secret: process.env.JWT_SECRET as string, // type mueyyen degilse hemin typi istifade etmesine komek edir
-      expiresIn: 15 * 60 * 1000,
-    });
-
-    const refreshToken = await this.jwt.signAsync(payload, {
-      secret: process.env.JWT_REFRESH_SECRET as string, // type mueyyen degilse hemin typi istifade etmesine komek edir
-      expiresIn: 7 * 24 * 60 * 60 * 1000,
-    });
-
-    return { accessToken, refreshToken };
+  private parseExpiration(exp: string) {
+    if (exp.endsWith('d')) return Number(exp.slice(0, -1)) * 86400;
+    if (exp.endsWith('h')) return Number(exp.slice(0, -1)) * 3600;
+    if (exp.endsWith('m')) return Number(exp.slice(0, -1)) * 60;
+    if (exp.endsWith('s')) return Number(exp.slice(0, -1));
+    const n = Number(exp);
+    return isNaN(n) ? 7 * 86400 : n;
   }
 
-  //*update Refresh Token
+  // Register returns user and triggers verification email in UsersService
+  async login(email: string, password: string, ip?: string, device?: string) {
+    const user = await this.usersService.findByEmail(email);
+    if (!user) throw new UnauthorizedException('Invalid credentials');
 
-  async updateRefreshToken(userId: string, refreshToken: string) {
-    const hashed = await bcrypt.hash(refreshToken, 10);
-    await this.UserService.update(userId, { refreshToken: hashed });
+    // rate limit check by email
+    const key = `rl:login:${email}`;
+    const window = Number(process.env.RATE_LIMIT_LOGIN_WINDOW || 600); // seconds
+    const max = Number(process.env.RATE_LIMIT_LOGIN_MAX || 5);
+    const requests = await this.redisClient.incr(key);
+    if (requests === 1) {
+      await this.redisClient.expire(key, window);
+    }
+    if (requests > max) {
+      // log and send security event (Kafka)
+      await this.kafkaService.produce('auth.security.alert', { type: 'bruteforce', email, ip, createdAt: new Date() });
+      throw new UnauthorizedException('Too many attempts. Try again later.');
+    }
+
+    const valid = await this.usersService.verifyPassword(user, password);
+    if (!valid) {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+    if (!user.isVerified) throw new UnauthorizedException('Email not verified');
+
+    // create tokens
+    const payload = { sub: user.id, email: user.email };
+    const accessToken = this.jwtService.sign(payload);
+
+    const refreshToken = randomBytes(64).toString('hex');
+
+    // create session in DB with hashed refresh token
+    const session = await this.usersService.createSession(user, refreshToken, ip, device);
+
+    // Optionally also store refresh token => sessionId mapping in redis for fast lookup
+    const redisKey = `refresh:session:${session.id}`;
+    const ttlSeconds = this.parseExpiration(process.env.JWT_REFRESH_TOKEN_EXPIRATION!);
+    await this.redisClient.set(redisKey, session.id, 'EX', ttlSeconds);
+
+    return { accessToken, refreshToken, sessionId: session.id, expiresIn: process.env.JWT_ACCESS_TOKEN_EXPIRATION!};
   }
 
-  //* register
-  async register(dto: RegisterDto) {
-    dto.password = await bcrypt.hash(dto.password, 10);
+  // Rotate refresh tokens: find session by matching provided refresh token
+  async refresh(oldRefreshToken: string) {
+    if (!oldRefreshToken) throw new BadRequestException('Refresh token required');
+    const session = await this.usersService.findSessionByRefreshToken(oldRefreshToken);
+    if (!session || session.revoked) throw new UnauthorizedException('Invalid refresh token');
 
-    const user = await this.UserService.create({
-      ...dto,
-      role: Role.USER,
-    });
+    // revoke old session entry
+    session.revoked = true;
+    session.revokedAt = new Date();
+    await this.usersService['sessionRepo'].save(session); // slight internal access; alternately add method
 
-    const tokens = await this.generateToken(user);
-
-    await this.updateRefreshToken(String(user._id), tokens.refreshToken);
-
-    return tokens;
-  }
-
-  //* login
-  async login(dto: LoginDto) {
-    const user = await this.UserService.findByEmailRaw(dto.email);
+    // create new session and token
+    const user = await this.usersService.findById(session.userId);
     if (!user) throw new UnauthorizedException('User not found');
 
-    const valid = await bcrypt.compare(dto.password, user.password);
-    if (!valid) throw new UnauthorizedException('Invalid credentials');
+    const newRefresh = randomBytes(64).toString('hex');
+    const newSession = await this.usersService.createSession(user, newRefresh, session.ip, session.device);
 
-    const tokens = await this.generateToken(user);
-    await this.updateRefreshToken(String(user._id), tokens.refreshToken);
+    const payload = { sub: user.id, email: user.email };
+    const accessToken = this.jwtService.sign(payload);
 
-    return tokens;
+    // cleanup older redis mapping if exists
+    await this.redisClient.del(`refresh:session:${session.id}`);
+    const ttlSeconds = this.parseExpiration(process.env.JWT_REFRESH_TOKEN_EXPIRATION!);
+    await this.redisClient.set(`refresh:session:${newSession.id}`, newSession.id, 'EX', ttlSeconds);
+
+    return { accessToken, refreshToken: newRefresh, sessionId: newSession.id };
   }
 
-  //*refresh
-  async refresh(user: any) {
-    const { id, refreshToken: incomingToken } = user;
-
-    const dbUser = await this.UserService.findById(id);
-
-    if (!dbUser || !dbUser.refreshToken) {
-      throw new UnauthorizedException('Refresh Token not found');
-    }
-
-    const tokenMatches = await bcrypt.compare(
-      incomingToken,
-      dbUser.refreshToken,
-    );
-
-    if (!tokenMatches) {
-      throw new UnauthorizedException('Refresh Token is Invalid');
-    }
-
-    const tokens = await this.generateToken(dbUser);
-    await this.updateRefreshToken(id, tokens.refreshToken);
-
-    return tokens;
+  async logout(refreshToken: string) {
+    // find session and revoke it
+    const session = await this.usersService.findSessionByRefreshToken(refreshToken);
+    if (!session) return; // idempotent
+    await this.usersService.revokeSession(session.id);
+    await this.redisClient.del(`refresh:session:${session.id}`);
   }
 }
